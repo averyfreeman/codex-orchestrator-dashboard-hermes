@@ -1,0 +1,61 @@
+name: Verify application, controls, and documentation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install managed Python and Ansible
+        run: |
+          uv python install 3.11
+          uv venv --python 3.11 .venv
+          uv pip install --python .venv/bin/python -r requirements-dev.txt
+
+      - name: Install JavaScript dependencies
+        run: npm ci --include=dev
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run application, control, docs, and public-snapshot gates
+        run: |
+          npm test
+          npm run lint
+          npx tsc --noEmit
+          npm run build
+          npm run test:e2e
+          npm run docs:check
+          npm run docs:build
+          .venv/bin/python scripts/test_sync_codex_profile.py
+          .venv/bin/python -m unittest scripts.test_codex_control scripts.test_codex_recovery scripts.test_herdr_sessions scripts.test_codex_sync scripts.test_macos_launchagents scripts.test_ansible_inventory scripts.test_resource_metrics
+          .venv/bin/python -m compileall -q scripts ansible/inventory.py
+          .venv/bin/python scripts/check_public_snapshot.py
+          PATH="$PWD/.venv/bin:$PATH" .venv/bin/ansible-playbook -i ansible/inventory.py --syntax-check ansible/playbooks/sync-linux-fleet.yml
