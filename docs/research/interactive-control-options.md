@@ -2,13 +2,17 @@
 
 **Status:** Architecture research for the dashboard. Hermes drafts plans, the operator reviews them, and Codex app-server runs the selected-host workers. Herdr named-session lifecycle controls remain separate. Sources below are upstream product documentation, protocol specifications, or source schemas, reviewed 2026-10-07.
 
+## Implementation status — 2026-10-14
+
+The protocol discussion below records design options, not fresh live verification. Codex worker control and Herdr named-session CLI controls are implemented. Herdr event subscriptions/reconnect snapshots, the exact one-time approval bridge, complete worker-owned child tracking/metrics, a bounded run-history list, 30-day aggregate telemetry, and the 90-day approval audit remain outstanding. Worker stop currently reconciles only Codex-tracked background terminals. Separate reboot-persistence and representative benchmark evidence is still required. See root `PLAN.md` for the roadmap assessment and acceptance criteria.
+
 ## Recommendation
 
 Keep worker control host-scoped. The browser selects a reviewed task and host; the dashboard backend connects to that host’s Codex app-server, starts or steers a turn, and streams app-server events back to the browser. A same-origin API check protects mutations; the dashboard is intended for private LAN and overlay access only.
 
 Use the native Codex app-server protocol for Codex work, and Herdr’s own session interface for Herdr lifecycle controls. Hermes plans and coordinates work but is not the worker runtime.
 
-Keep dashboard start/stop controls to **Codex turns** and **Herdr sessions**. Do not expose app-server daemon lifecycle or arbitrary remote shell/process controls in this dashboard.
+Keep ordinary start/stop controls scoped to **Codex turns** and **Herdr sessions**. ADRs 0005–0007 document narrow exceptions for down-only daemon recovery and the opt-in managed-idle sync restart. Arbitrary remote shell/process controls remain excluded.
 
 ## Interaction model
 
@@ -65,4 +69,4 @@ Each worker is a Codex app-server thread/turn on one inventory-listed host. The 
 4. Complete the exact one-time approval flow before enabling tasks that require permissions beyond the home-scoped V1 policy.
 5. Benchmark resource use under idle monitoring and one representative active turn/session. Track gateway RSS/CPU, remote collector RSS/CPU, probe duration, event volume, and actual agent token usage. The dashboard now reports sampled host CPU/load, memory, and home-volume disk; use the 30-second metrics to compare idle and active-work baselines.
 
-The Codex managed app-server daemon is a separate, explicitly experimental lifecycle interface; restarting/stopping it can interrupt active or queued work. It is intentionally outside the dashboard’s start/stop surface. [Codex app-server daemon lifecycle](https://github.com/openai/codex/blob/main/codex-rs/app-server-daemon/README.md)
+The Codex managed app-server daemon is a separate, explicitly experimental lifecycle interface; restarting/stopping it can interrupt active or queued work. General daemon stop/restart remains outside the dashboard surface; the documented down-only start and managed-idle sync restart are narrow exceptions. [Codex app-server daemon lifecycle](https://github.com/openai/codex/blob/main/codex-rs/app-server-daemon/README.md)

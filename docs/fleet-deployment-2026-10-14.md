@@ -4,7 +4,7 @@
 
 The approved custom-plugin subsets and main, focused, and sysadmin configurations are installed on Maccauley, Flautist, dc2, and moltbuntu. All four CLI installations and running daemons report 0.162.1. Fresh invocations initialized every enabled local stdio MCP in the approved configurations. Standalone OpenAI Developer Docs and Cloudflare HTTP initialization returned 403 from this environment and remains unverified.
 
-The work is on branch `repair/codex-fleet-sync`. No repository publication or remote account mutation was performed. The older OpenClaw dashboard was retained as a reference; OCI was excluded.
+The fleet repair was published to `main` as commit `118c2ded19cda07d1ffb0ad48fc2ce6c454f1bdf` with annotated tag `v0.1.1`. Fleet verification did not change external account state. The older OpenClaw dashboard was retained as a reference; OCI was excluded.
 
 ## Source findings and corrections
 

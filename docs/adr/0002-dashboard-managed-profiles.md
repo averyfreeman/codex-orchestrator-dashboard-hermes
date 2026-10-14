@@ -6,7 +6,9 @@ The operator requested permissive Codex defaults on local machines and dashboard
 
 ## Decision
 
-Set the shared Codex user defaults to `model = "gpt-6-luna"`, maximum reasoning effort, `approval_policy = "never"`, `sandbox_mode = "workspace-write"`, the current user's home directory as an additional writable root, command networking enabled, and `web_search = "live"`. Apply these values through the profile synchronizer on Maccauley and the configured Linux fleet. Preserve authentication, MCP/plugin configuration, and other machine-specific settings.
+Set the shared Codex user defaults to `model = "gpt-6.1-sol"`, medium reasoning effort, `approval_policy = "never"`, `sandbox_mode = "workspace-write"`, the current user's home directory as an additional writable root, command networking enabled, and `web_search = "live"`. Apply these values through the profile synchronizer on Maccauley and the configured Linux fleet. Preserve authentication, MCP/plugin configuration, and other machine-specific settings.
+
+The shared model defaults were updated on 2026-10-14 to follow the corrected Maccauley baseline (ADR 0007). The request-scoped dashboard worker model remains `gpt-6-luna` with maximum reasoning effort (ADR 0004); focused and other explicit profiles retain their own settings.
 
 Dashboard-initiated turns use the same sandbox boundary and approval policy through request-scoped app-server settings. A dashboard-managed network switch starts on and controls both sandbox command networking and live web search for later turns without editing the user's config file.
 

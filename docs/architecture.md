@@ -7,7 +7,7 @@ The dashboard has two planes:
 - **Observe:** the Next.js gateway polls bounded host metadata and presents Codex app-server, Herdr, and Treehouse state.
 - **Control:** Hermes drafts a dependency-aware plan without dispatching work. The operator reviews and starts the plan; the dashboard connects to inventory-listed Codex app-servers for worker turns and uses Herdr’s named-session interface for session lifecycle actions.
 
-The host inventory and SSH keys are private local configuration. Remote SSH uses the first configured route, with ZeroTier first and Tailscale as failover. Both routes use `BatchMode=yes`, strict host-key checking, and a stable per-host key alias. The dashboard does not expose general SSH or service-manager actions.
+The host inventory and SSH keys are private local configuration. Remote SSH uses private LAN, ZeroTier, and Tailscale routes in private-inventory order, with configured verified fallbacks. All routes use `BatchMode=yes`, strict host-key checking, and a stable per-host key alias. The dashboard does not expose general SSH or service-manager actions.
 
 ## 1. Observation and metadata flow
 
@@ -16,7 +16,7 @@ flowchart LR
     Browser[Operator browser] -->|Private dashboard| Gateway[Dashboard gateway]
     Gateway --> Collector[Bounded metadata collector]
     Collector -->|Local probe| Local[Selected local host]
-    Collector -->|ZeroTier first; Tailscale fallback over strict SSH| Remote[Configured remote hosts]
+    Collector -->|Configured LAN and overlay routes over strict SSH| Remote[Configured remote hosts]
     Local --> Reports[Sanitized host reports]
     Remote --> Reports
     Reports --> Gateway
@@ -32,14 +32,14 @@ sequenceDiagram
     participant U as Operator
     participant UI as Dashboard UI
     participant G as Dashboard gateway
-    participant Z as ZeroTier SSH
-    participant T as Tailscale SSH
+    participant Z as Preferred strict SSH route
+    participant T as Configured strict SSH fallback
     participant H as Selected host
     participant C as Codex app-server
     U->>UI: Select host and profile
     UI->>G: Start/resume thread and turn
     G->>Z: Start app-server proxy over strict SSH
-    alt ZeroTier unavailable
+    alt Preferred route unavailable
         G->>T: Retry using strict SSH failover
     end
     G->>C: JSON-RPC over WebSocket carried by proxy stdio
@@ -59,7 +59,7 @@ Use Codex app-server directly for Codex threads and turns. Use Herdr’s named-s
 
 Hermes API Server drafts a plan only when its dedicated planning profile has no tools enabled. The dashboard validates the task graph and inventory host assignments, then presents each worker prompt for review. No worker starts until the operator explicitly starts the run. Codex app-server remains the worker runtime; Hermes does not replace host-scoped threads and turns.
 
-Ready tasks dispatch in dependency order, up to four active primary workers per host. Queue is the default worker mode; Live steer is opt-in per worker and targets the exact stored thread and turn IDs. The dashboard persists only run/task IDs, host assignments, status and bounded cleanup metadata—not plan prompts, worker prompts, replies, or tool output. Saved metadata expires after seven days. A lost observation stream marks work stale and reconciles IDs; it does not restart or duplicate workers.
+Ready tasks dispatch in dependency order, up to four active primary workers per host. Queue is the default worker mode; Live steer is opt-in per worker and targets the exact stored thread and turn IDs. The dashboard persists only run/task IDs, host assignments, status and bounded cleanup metadata—not plan prompts, worker prompts, replies, or tool output. Terminal run metadata expires seven days after `completedAt`; runs without a completion timestamp remain retained. A bounded run-history list is not yet implemented. Worker cleanup covers Codex-tracked background terminals only; detached or untracked descendants and their per-worker resource metrics remain outstanding. A lost observation stream marks work stale and reconciles IDs; it does not restart or duplicate workers.
 
 ## Profiles and permission controls
 
@@ -78,7 +78,7 @@ This profile is high-trust: with the switch on and `$HOME` writable, approved to
 | Host health | Bounded probe: CPU percentage, load, available/total memory, home-volume free/total space, versions, process counts | None | One short command per host per interval; CPU sampling adds about 200 ms on Linux |
 | Codex status | App-server event stream plus thread/turn state | None to observe | One SSH proxy stream per active turn and small projected event payloads |
 | Codex usage | App-server token-usage notifications: input, cached input, output, reasoning, total/context window | None to read | Negligible event parsing and storage |
-| Herdr state | Event subscription with snapshot on reconnect | None to observe | Event-driven; snapshots only on reconnect or resync |
+| Herdr state | Named-session CLI listing and lifecycle controls are implemented; event subscription and snapshot recovery are outstanding | None to observe | Bounded CLI query today; event-stream cost has not been measured |
 | Hermes planning | Server-side API run and status reconciliation | Model-dependent | One planning run per reviewed request; the planning profile has no tools enabled |
 | Agent work | Codex worker turn or Herdr agent | Model-dependent | Usually the dominant host CPU/RAM cost; measure representative work |
 
@@ -86,7 +86,7 @@ Polling is approximately `host_count × 60 / interval_seconds` probes per minute
 
 Resource warnings default to CPU at or above 75% for 60 seconds, memory at or above 80%, and home-volume disk at or above 80%. Server-side overrides are `DASHBOARD_CPU_WARN_PERCENT`, `DASHBOARD_CPU_WARN_SUSTAINED_SECONDS`, `DASHBOARD_MEMORY_WARN_PERCENT`, and `DASHBOARD_DISK_WARN_PERCENT`; percentage values must be 1–100 and sustained seconds 1–3600. Sustained CPU warnings require consecutive 30-second samples and reset after a gap over 60 seconds or a lower reading.
 
-Keep orchestration metadata and resource metrics for up to seven days, subject to the 1,000-event / 1 MB local log limits; approval decisions, when supported, use a separate 90-day audit retention. Store private operational data with owner-only filesystem permissions. Never store credentials, environment values, prompts, transcripts, or raw terminal output by default.
+Current storage has two distinct bounds: `orchestration-store.ts` prunes terminal runs seven days after `completedAt` and retains unfinished runs; `logging.ts` prunes operational events and numeric resource samples after seven days and caps the log at 1,000 events / 1 MB, so samples can disappear earlier. The run store does not share the event-log size cap. Separate 30-day aggregate telemetry and 90-day content-free approval-decision stores remain required and are not implemented. The latter depends on the exact approval bridge; existing home-scoped permission handling is not that bridge. Store private operational data with owner-only filesystem permissions. Never store credentials, environment values, prompts, transcripts, or raw terminal output by default.
 
 ## Host setup and configuration propagation
 

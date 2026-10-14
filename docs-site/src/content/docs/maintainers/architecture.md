@@ -13,7 +13,7 @@ The dashboard separates **observation** from **control**. Observation gathers bo
     Browser[Operator browser] -->|private dashboard| Gateway[Next.js gateway]
     Gateway --> Collector[Bounded collector]
     Collector -->|local probe| Local[Gateway host]
-    Collector -->|ZeroTier, then Tailscale over strict SSH| Fleet[Configured remote hosts]
+    Collector -->|Configured LAN and overlay routes over strict SSH| Fleet[Configured remote hosts]
     Local --> Snapshot[Sanitized report]
     Fleet --> Snapshot
     Snapshot --> Gateway
@@ -32,7 +32,7 @@ The request-time routes and local JSONL store are why the live Next.js app stays
     participant App as Host Codex app-server
     Operator->>UI: Select host/profile and submit prompt
     UI->>Gateway: POST selected host, prompt, optional thread
-    Gateway->>SSH: Start host-local proxy (ZeroTier first)
+    Gateway->>SSH: Start host-local proxy (inventory route order)
     SSH->>App: Carry app-server RPC stream
     App-->>UI: Projected output, state, usage
     Operator->>UI: Interrupt selected turn
@@ -71,7 +71,7 @@ Codex sync is a separate, operator-started control flow. Health polling stays re
 
 The `CODEX_HOME` value is resolved per host from its private inventory override, the dashboard process environment for the local host, or `~/.codex`. The resolved value is supplied explicitly to probes, control, recovery, and sync. The macOS LaunchAgent installer reads its local override from the private inventory, and Ansible expands each remote override against that host's home before configuring Codex commands and managed systemd units. Host-relative paths are normalized for comparison; a target keeps its own home path, and browser responses contain a safe label rather than its absolute override.
 
-The plan compares installed CLI and running app-server versions separately, supported marketplace/plugin state, portable settings in `config.toml` and top-level `*.config.toml` profiles, and user-owned skills. When CLI versions differ, the fixed helper invokes the official Codex installer pinned to the reference release and verifies the installed version. Unsafe or unclassified config, secrets, auth, machine-specific values, repo/system skills, and generated plugin caches stay local. Local plugin sources must pass bounded path and content validation. Apply rechecks state and rejects expired or stale plans. Config/profile edits are validated and atomic with private backups; durable run data and telemetry contain only IDs, versions, category outcomes, restart status, and counts. The optional post-apply restart is attempted once for an affected managed daemon when it can be proven idle; otherwise runtime drift is reported as deferred. See the canonical [Codex sync architecture](https://github.com/averyfreeman/codex-orchestrator-dashboard-hermes/blob/main/docs/architecture.md#codex-fleet-sync), [operator walkthrough](../operators/codex-sync/), and [ADR 0006](https://github.com/averyfreeman/codex-orchestrator-dashboard-hermes/blob/main/docs/adr/0006-codex-fleet-sync.md).
+The plan compares installed CLI and running app-server versions separately, supported marketplace/plugin state, portable settings in `config.toml` and top-level `*.config.toml` profiles, and user-owned skills. When CLI versions differ, the fixed helper invokes the official Codex installer pinned to the reference release and verifies the installed version. Unsafe or unclassified config, secrets, auth, machine-specific values, repo/system skills, and generated plugin caches stay local. Local plugin sources must pass bounded path and content validation. Apply rechecks state and rejects expired or stale plans. Config/profile edits are validated and atomic with private backups; durable run data and telemetry contain only IDs, versions, category outcomes, restart status, and counts. The optional post-apply restart is attempted once for an affected managed daemon when it can be proven idle; otherwise runtime drift is reported as deferred. Platform-aware deployments additionally check host identity, transfer bounded checksum-verified archives with executable metadata, and adapt MCP definitions, role layers, and profiles through a private capability matrix; see [ADR 0007](https://github.com/averyfreeman/codex-orchestrator-dashboard-hermes/blob/main/docs/adr/0007-platform-aware-fleet-deployment.md). See the canonical [Codex sync architecture](https://github.com/averyfreeman/codex-orchestrator-dashboard-hermes/blob/main/docs/architecture.md#codex-fleet-sync), [operator walkthrough](../operators/codex-sync/), and [ADR 0006](https://github.com/averyfreeman/codex-orchestrator-dashboard-hermes/blob/main/docs/adr/0006-codex-fleet-sync.md).
 
 ## Data boundaries
 
@@ -88,4 +88,4 @@ The plan compares installed CLI and running app-server versions separately, supp
 
 GitHub Pages serves `docs-site/` as a static guide. It does not serve the Next.js dashboard or its APIs. Static export is not suitable for the current app: the app uses dynamic request-dependent route handlers, an SSE control response, subprocess bridges, and local filesystem telemetry. Next.js documents request-dependent Route Handlers and other runtime features as unsupported in static export; see [Next.js Static Exports](https://nextjs.org/docs/app/guides/static-exports).
 
-Astro/Starlight builds the guide with the repository base path `/codex-orchestrator-dashboard/`. The Pages workflow checks out `main`, installs from the committed npm lockfile, builds `docs-site/dist`, and deploys only that artifact. The workflow grants read-only contents to build and Pages write plus OIDC deployment access to the deploy job. See [Astro’s GitHub Pages guide](https://docs.astro.build/en/guides/deploy/github/).
+Astro/Starlight builds the guide with the repository base path `/codex-orchestrator-dashboard/`. The Pages workflow checks out the exact successful verification commit on `main`, installs from the committed npm lockfile, builds `docs-site/dist`, and deploys only that artifact. The workflow grants read-only contents to build and Pages write plus OIDC deployment access to the deploy job. See [Astro’s GitHub Pages guide](https://docs.astro.build/en/guides/deploy/github/).

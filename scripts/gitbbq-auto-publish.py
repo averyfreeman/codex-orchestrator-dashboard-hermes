@@ -103,7 +103,7 @@ def main() -> int:
         ["npx", "tsc", "--noEmit"],
         ["npm", "run", "build"],
         ["python3", "scripts/test_sync_codex_profile.py"],
-        ["python3", "-m", "unittest", "scripts/test_macos_launchagents.py"],
+        ["python3", "-m", "unittest", "scripts.test_macos_launchagents", "scripts.test_fleet_artifacts"],
         ["python3", "-m", "py_compile", "scripts/probe.py", "scripts/sync_codex_profile.py", "scripts/check_public_snapshot.py", "scripts/gitbbq-auto-publish.py", "ansible/inventory.py"],
         ["ansible-playbook", "-i", "inventory.py", "--syntax-check", "playbooks/sync-linux-fleet.yml"],
     ]

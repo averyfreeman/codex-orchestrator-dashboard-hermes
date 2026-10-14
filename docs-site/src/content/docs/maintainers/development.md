@@ -28,7 +28,7 @@ npm run test:e2e
 npm run docs:check
 npm run docs:build
 .venv/bin/python scripts/test_sync_codex_profile.py
-.venv/bin/python -m unittest scripts.test_codex_control scripts.test_codex_recovery scripts.test_herdr_sessions scripts.test_codex_sync scripts.test_macos_launchagents scripts.test_ansible_inventory scripts.test_resource_metrics
+.venv/bin/python -m unittest scripts.test_codex_control scripts.test_codex_recovery scripts.test_herdr_sessions scripts.test_codex_sync scripts.test_macos_launchagents scripts.test_ansible_inventory scripts.test_resource_metrics scripts.test_fleet_artifacts
 .venv/bin/python -m compileall -q scripts ansible/inventory.py
 .venv/bin/python scripts/check_public_snapshot.py
 PATH="$PWD/.venv/bin:$PATH" .venv/bin/ansible-playbook -i ansible/inventory.py --syntax-check ansible/playbooks/sync-linux-fleet.yml
