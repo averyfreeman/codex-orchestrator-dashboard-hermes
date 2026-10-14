@@ -1,15 +1,20 @@
+import { localPythonRuntime } from "@/lib/helper-runtime";
+import { deploymentPolicy, permitsPlugin, permitsSetting } from "@/lib/deployment-policy";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { configuredCodexHome, HOSTS, type HostDefinition } from "@/lib/hosts";
 import { appendEvent } from "@/lib/logging";
 
 const PLAN_TTL_MS = 10 * 60_000;
 const HELPER_MAX_OUTPUT = 40 * 1024 * 1024;
 const APPLY_TIMEOUT_MS = 12 * 60_000;
-const helperSource = readFile(path.join(process.cwd(), "scripts/codex_sync.py"), "utf8");
+const helperSource = Promise.all(["fleet_artifacts.py", "fleet_install.py", "codex_sync.py"].map((name) => readFile(path.join(process.cwd(), "scripts", name), "utf8"))).then((sources) => "from __future__ import annotations\n" + sources.map((source) => source.replace(/^from __future__ import annotations\n/gm, "")).join("\n"));
+function deploymentHash() { return createHash("sha256").update(JSON.stringify(deploymentPolicy())).digest("hex"); }
 const plans = new Map<string, StoredPlan>();
 const runningHosts = new Set<string>();
 
@@ -48,9 +53,10 @@ export type CodexSyncPlanResponse = {
 
 type HelperFile = { name: string; exists: boolean; hash: string | null; portable: Record<string, string | boolean>; unclassified: Record<string, string>; invalid: boolean };
 type HelperSkill = { hash: string; files: Record<string, string>; fileNames: string[]; fileHashes: Record<string, string>; transferBlocked?: boolean };
-type HelperPlugin = { name: string; marketplaceName: string; enabled: boolean; marketplaceKind: string; selector: string; version?: string; packageHash?: string; transferBlocked?: boolean };
+type HelperPlugin = { name: string; marketplaceName: string; enabled: boolean; marketplaceKind: string; selector: string; version?: string; artifactHash?: string; packageHash?: string; transferBlocked?: boolean };
 type HelperMarketplace = { name: string; kind: string; source?: string | null; ref?: string | null; sparsePaths?: string[]; root?: string | null; replace?: boolean; existing?: boolean };
 type HelperSnapshot = {
+  dependencies?: Record<string, string | null>;
   cliVersion: string | null;
   runtimeVersion: string | null;
   runtimeStatus: string;
@@ -74,6 +80,7 @@ type HelperSnapshot = {
 };
 
 type HostActions = {
+  artifactStage?: { artifact: string; dependencies: string; plugins: string[]; daisyui: boolean };
   config: Array<{ name: string; values: Record<string, string | boolean>; remove: string[] }>;
   plugins: { marketplaces: HelperMarketplace[]; localPackages: Record<string, Record<string, Record<string, string>>>; add: Array<{ name: string; marketplaceName: string }>; remove: Array<{ name: string; marketplaceName: string }> };
   skills: { write: Array<{ root: string; skill: string; path: string; content: string }>; delete: Array<{ root: string; skill: string }>; deleteFiles: Array<{ root: string; skill: string; path: string }> };
@@ -86,6 +93,7 @@ type StoredPlan = {
   snapshots: Map<string, HelperSnapshot>;
   actions: Map<string, HostActions>;
   expiresAtMs: number;
+  deploymentHash: string;
 };
 
 type RunCategory = { status: SyncCategoryStatus; count?: number; message?: string };
@@ -136,16 +144,18 @@ function isJsonRecord(value: unknown): value is JsonRecord {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-async function invokeHelper(host: HostDefinition, request: Record<string, unknown>, timeoutMs = 30_000): Promise<JsonRecord> {
+async function invokeHelper(host: HostDefinition, request: Record<string, unknown>, timeoutMs = 120_000): Promise<JsonRecord> {
   const source = await helperSource;
-  const payload = JSON.stringify({ ...request, codexHome: configuredCodexHome(host) }) + "\n";
-  const runCommand = (command: string, args: string[]) => new Promise<{ stdout: string; code: number | null }>((resolve, reject) => {
+  const payload = JSON.stringify({ ...request, identity: host.identity, codexHome: configuredCodexHome(host) }) + "\n";
+  const runCommand = (command: string, args: string[]) => new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: process.cwd(),
-      stdio: ["pipe", "pipe", "ignore"],
-      env: host.local ? { ...process.env, CODEX_HOME: localCodexHome(host) } : process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      env: host.local ? { ...localPythonRuntime(host.identity?.system).environment, CODEX_HOME: localCodexHome(host) } : process.env,
     });
     const chunks: Buffer[] = [];
+    let diagnostics = "";
+    child.stderr.on("data", (chunk: Buffer) => { if (diagnostics.length < 4096) diagnostics += chunk.toString("utf8"); });
     let size = 0;
     let settled = false;
     const finishError = (error: Error) => {
@@ -171,16 +181,16 @@ async function invokeHelper(host: HostDefinition, request: Record<string, unknow
       clearTimeout(timer);
       if (settled) return;
       settled = true;
-      resolve({ stdout: Buffer.concat(chunks).toString("utf8"), code });
+      resolve({ stdout: Buffer.concat(chunks).toString("utf8"), stderr: diagnostics, code });
     });
     child.stdin.on("error", () => undefined);
     child.stdin.end(payload);
   });
-  let result: { stdout: string; code: number | null };
+  let result: { stdout: string; stderr: string; code: number | null };
   if (host.local) {
-    result = await runCommand("python3", ["-c", source]);
+    result = await runCommand(localPythonRuntime(host.identity?.system).command, ["-c", source]);
   } else {
-    let succeeded: { stdout: string; code: number | null } | null = null;
+    let succeeded: { stdout: string; stderr: string; code: number | null } | null = null;
     for (const route of host.sshRoutes ?? []) {
       try {
         const attempt = await runCommand("ssh", [
@@ -209,12 +219,42 @@ async function invokeHelper(host: HostDefinition, request: Record<string, unknow
   try {
     envelope = JSON.parse(result.stdout.trim()) as JsonRecord;
   } catch {
-    throw new Error("Codex sync helper returned an invalid response.");
+    const runtimeFailure = /error while loading shared libraries/.test(result.stderr) ? "Python could not load a required shared library." : /SyntaxError/.test(result.stderr) ? "Python could not compile the helper." : /Traceback/.test(result.stderr) ? "Python helper raised an interpreter exception." : "No valid helper JSON was returned.";
+    throw new Error(`Codex sync helper failed (exit ${result.code ?? "unknown"}): ${runtimeFailure}`);
   }
   if (!envelope.ok || !isJsonRecord(envelope.result)) {
     throw new Error(typeof envelope.error === "string" ? envelope.error : "Codex sync operation failed.");
   }
   return envelope.result;
+}
+
+async function transferDeploymentArtifacts(host: HostDefinition) {
+  const policy = deploymentPolicy();
+  if (!policy?.archive || !policy.artifactPath || !policy.dependencyArchive || !policy.dependencyArtifactPath) throw new Error("Approved deployment artifacts are missing.");
+  // Verify identity immediately before the first staging mutation.
+  await invokeHelper(host, { operation: "stage-directory", artifacts: [policy.archive, policy.dependencyArchive] });
+  for (const [file, digest] of [[policy.artifactPath, policy.archive], [policy.dependencyArtifactPath, policy.dependencyArchive]]) {
+    const info = await stat(file);
+    if (!info.isFile() || info.size > 512 * 1024 * 1024) throw new Error("Deployment artifact exceeds the file-backed staging bound.");
+    const hash = createHash("sha256");
+    for await (const chunk of createReadStream(file)) hash.update(chunk);
+    if (hash.digest("hex") !== digest || !/^[a-f0-9]{64}$/.test(digest)) throw new Error("Deployment artifact checksum mismatch.");
+    if (host.local) continue; // Local artifacts already occupy the fixed staging directory.
+    let transferred = false;
+    for (const route of host.sshRoutes ?? []) {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const child = spawn("scp", ["-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=yes", "-o", `HostKeyAlias=${route.hostKeyAlias}`, file, `${route.target}:build/codex-fleet-sync/artifacts/${digest}.tar.gz`], { stdio: "ignore" });
+          const timer = setTimeout(() => { child.kill("SIGTERM"); reject(new Error("Artifact transfer timed out.")); }, 300_000);
+          child.on("error", () => { clearTimeout(timer); reject(new Error("Artifact transfer could not start.")); });
+          child.on("close", (code) => { clearTimeout(timer); if (code === 0) resolve(); else reject(new Error("Artifact transfer failed.")); });
+        });
+        transferred = true;
+        break;
+      } catch { /* Retry only configured strict routes. Target verifies the digest before extraction. */ }
+    }
+    if (!transferred) throw new Error("No verified artifact transfer route succeeded.");
+  }
 }
 
 function localCodexHome(host: HostDefinition) {
@@ -278,8 +318,8 @@ function settingDiffs(
       category: categoryName,
       item: `${source.name} · ${name}`,
       kind: Object.hasOwn(sourceValues, name) ? (Object.hasOwn(targetValues, name) ? "update" : "add") : "remove",
-      sourceValue: sourceValues[name] ?? null,
-      targetValue: targetValues[name] ?? null,
+      sourceValue: name.startsWith("mcp_servers.ubuntu-") ? "Host-adapted Ubuntu setting" : sourceValues[name] ?? null,
+      targetValue: name.startsWith("mcp_servers.ubuntu-") ? "Host-adapted Ubuntu setting" : targetValues[name] ?? null,
     });
     changed++;
   }
@@ -304,9 +344,46 @@ export function makeActionsAndView(
   target: HelperSnapshot,
   included: boolean,
 ): { view: SyncHostPlan; actions: HostActions } {
+  const policy = deploymentPolicy();
+  const exclusions: string[] = [];
+  if (policy?.hosts[targetHost.slug]) {
+    source = structuredClone(source);
+    const managedFiles = new Set(["config.toml", "focused.config.toml", "sysadmin.config.toml", "worker.config.toml", "manager.config.toml"]);
+    source.config.files = source.config.files.filter((file) => managedFiles.has(file.name));
+    source.skills = structuredClone(target.skills);
+    exclusions.push("User skills remain host-owned; approved plugin skills are included in release artifacts.");
+    for (const file of source.config.files) {
+      file.portable = { ...(target.config.files.find((item) => item.name === file.name)?.portable ?? {}), ...file.portable };
+      // Ubuntu execution routes and sudo paths come from the reviewed host variant.
+      for (const key of Object.keys(file.portable)) if (key.startsWith("mcp_servers.ubuntu-")) delete file.portable[key];
+      Object.assign(file.portable, policy.hostSettings?.[targetHost.slug]?.[file.name] ?? {});
+      for (const key of Object.keys(file.portable)) {
+        if (!permitsSetting(policy, targetHost.slug, key)) { delete file.portable[key]; exclusions.push("daisyUI excluded by the host capability matrix."); }
+      }
+    }
+    source.plugins.plugins = source.plugins.plugins.filter((plugin) => {
+      const allowed = permitsPlugin(policy, targetHost.slug, plugin.name, plugin.marketplaceName);
+      if (!allowed) exclusions.push(`${plugin.name}: excluded by the host capability matrix.`);
+      return allowed;
+    });
+    const missing = ["node", "uv"].filter((name) => target.dependencies && !target.dependencies[name]);
+    for (const name of missing) exclusions.push(`${name}: dependency must be provisioned before native activation.`);
+    // Preserve each target's official/native integrations and enabled state.
+    source.plugins.plugins = [
+      ...source.plugins.plugins.filter((item) => item.marketplaceKind !== "managed"),
+      ...target.plugins.plugins.filter((item) => item.marketplaceKind === "managed"),
+    ];
+    source.plugins.marketplaces = source.plugins.marketplaces.filter((item) => !item.name.includes("preview"));
+    const stagedMarket = target.plugins.marketplaces.find((item) => item.name === "fleet-release");
+    if (stagedMarket) source.plugins.marketplaces.push(stagedMarket);
+    for (const market of target.plugins.marketplaces.filter((item) => item.kind === "managed")) {
+      if (!source.plugins.marketplaces.some((item) => item.name === market.name)) source.plugins.marketplaces.push(market);
+    }
+  }
   const actions: HostActions = { config: [], plugins: { marketplaces: [], localPackages: {}, add: [], remove: [] }, skills: { write: [], delete: [], deleteFiles: [] } };
   const diffs: SyncDiff[] = [];
   const blocked: string[] = [];
+  for (const message of new Set(exclusions)) diffs.push({ category: "plugins", item: "Deployment exclusion", kind: "info", message });
   const categories: SyncHostPlan["categories"] = {
     cli: category(), runtime: category(), plugins: category(), config: category(), profiles: category(), skills: category(), codexHome: category(),
   };
@@ -391,8 +468,23 @@ export function makeActionsAndView(
         pluginIssues.add(selector);
         continue;
       }
+      const adopted = policy?.hosts[targetHost.slug] && target.plugins.plugins.find((item) => item.name === plugin.name && item.marketplaceName === "fleet-release" && item.enabled && item.version === plugin.version && Boolean(item.artifactHash) && item.artifactHash === policy.packageHashes?.[plugin.name]);
+      const platformRelease = policy?.hosts[targetHost.slug]?.plugins.includes(plugin.name) && !plugin.marketplaceName.startsWith("openai-") && targetHost.identity?.system === "Linux";
+      if (platformRelease && policy?.archive && policy.dependencyArchive) {
+        desired.delete(selector);
+        desired.add(`${plugin.name}@fleet-release`);
+        sourcePlugins.delete(selector);
+        if (adopted) {
+          diffs.push({ category: "plugins", item: plugin.name, kind: "info", message: "Content and executable metadata match the approved platform artifact." });
+        } else {
+          actions.artifactStage = { artifact: policy.archive, dependencies: policy.dependencyArchive, plugins: policy.hosts[targetHost.slug].plugins, daisyui: policy.hosts[targetHost.slug].daisyui };
+          diffs.push({ category: "plugins", item: plugin.name, kind: "update", message: "Stage checksum-verified platform artifacts, install native dependencies, and activate the approved release package." });
+          pluginChanges++;
+        }
+        continue;
+      }
       if (plugin.transferBlocked) {
-        blocked.push(`${selector}: validated local package transfer is blocked.`);
+        blocked.push(`${selector}: native build or dependency staging is required; the JSON transfer limit is unchanged.`);
         pluginIssues.add(selector);
         continue;
       }
@@ -468,10 +560,11 @@ export function makeActionsAndView(
     categories.plugins = category(pluginBlocked ? "blocked" : pluginChanges ? "drift" : "in-sync", pluginChanges, pluginBlocked);
   }
 
-  const sourceSkills = source.skills.skills;
-  const targetSkills = target.skills.skills;
-  const sourceBlocked = new Set(source.skills.blocked);
-  const targetBlocked = new Set(target.skills.blocked);
+  const managedSkillScope = Boolean(policy?.hosts[targetHost.slug]);
+  const sourceSkills = managedSkillScope ? {} : source.skills.skills;
+  const targetSkills = managedSkillScope ? {} : target.skills.skills;
+  const sourceBlocked = new Set(managedSkillScope ? [] : source.skills.blocked);
+  const targetBlocked = new Set(managedSkillScope ? [] : target.skills.blocked);
   let skillChanges = 0;
   for (const [key, skill] of Object.entries(sourceSkills)) {
     const [root, skillName] = key.split("/", 2);
@@ -595,11 +688,13 @@ export async function createCodexSyncPlan(input: { sourceHostSlug: string; targe
     throw new CodexSyncError("The selected source host could not be inspected over its configured route.", 502);
   }
   if (!source.cliVersion) throw new CodexSyncError("The selected source host does not report an installed Codex CLI version.", 409);
+  const policy = deploymentPolicy();
+  if (policy && source.cliVersion !== policy.cliVersion) throw new CodexSyncError("Reference CLI differs from the pinned deployment release.", 409);
   const inspectedPeers = await Promise.all(peerHosts.map(async (host) => {
     try {
       return { host, snapshot: await inspectHost(host, false), error: null as string | null };
-    } catch {
-      return { host, snapshot: null, error: "Host did not respond to the on-demand sync inspection." };
+    } catch (error) {
+      return { host, snapshot: null, error: error instanceof Error ? error.message : "Host did not respond to the on-demand sync inspection." };
     }
   }));
   const reachableSlugs = new Set(inspectedPeers.filter((item) => item.snapshot).map((item) => item.host.slug));
@@ -635,7 +730,7 @@ export async function createCodexSyncPlan(input: { sourceHostSlug: string; targe
       blocked: hostViews.filter((view) => view.included).reduce((sum, view) => sum + view.counts.blocked, 0),
     },
   };
-  plans.set(response.planId, { response, sourceHost, targetHosts: peerHosts.filter((host) => chosenSlugs.includes(host.slug)), snapshots, actions, expiresAtMs });
+  plans.set(response.planId, { response, sourceHost, targetHosts: peerHosts.filter((host) => chosenSlugs.includes(host.slug)), snapshots, actions, expiresAtMs, deploymentHash: deploymentHash() });
   void appendEvent({ source: "codex-sync", host: sourceHost.slug, type: "codex.sync.plan_created", stats: { targetCount: response.summary.hosts, reachableCount: response.summary.reachable, changeCount: response.summary.changes, blockedCount: response.summary.blocked, cliVersion: source.cliVersion } }).catch(() => undefined);
   return response;
 }
@@ -695,6 +790,7 @@ export async function startCodexSyncApply(planId: string, restartWhenFinished: b
   expirePlans();
   const plan = plans.get(planId);
   if (!plan || plan.expiresAtMs <= Date.now()) throw new CodexSyncError("This sync plan expired. Create a fresh plan to continue.", 409);
+  assertPlanSnapshotHash(plan.deploymentHash, deploymentHash());
   if (plan.response.summary.reachable === 0) throw new CodexSyncError("No selected target host is reachable. Create a plan with at least one reachable peer.", 409);
   const locks = [plan.sourceHost.slug, ...plan.response.targetSlugs];
   if (locks.some((slug) => runningHosts.has(slug))) throw new CodexSyncError("A Codex sync run is already using one of the selected hosts.", 409);
@@ -764,6 +860,10 @@ async function executeRun(plan: StoredPlan, run: PersistedRun) {
     run.updatedAt = new Date().toISOString();
     await persistRun(run);
     try {
+      if (actions.artifactStage) {
+        await transferDeploymentArtifacts(host);
+        await invokeHelper(host, { operation: "activate-artifact", ...actions.artifactStage }, APPLY_TIMEOUT_MS);
+      }
       const result = await invokeHelper(host, {
         operation: "apply",
         runId: run.runId,
@@ -771,6 +871,7 @@ async function executeRun(plan: StoredPlan, run: PersistedRun) {
         config: actions.config,
         plugins: actions.plugins,
         skills: actions.skills,
+        nativeActivated: Boolean(actions.artifactStage),
       }, APPLY_TIMEOUT_MS);
       const categories = isJsonRecord(result.categories) ? result.categories : {};
       row.categories = {

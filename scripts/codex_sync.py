@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import pathlib
+import platform
 import re
 import select
 import shutil
@@ -208,6 +209,49 @@ def _redact_and_normalize(value: Any, home: pathlib.Path, parent_key: str = "") 
     return _normalize_host_paths(value, home)
 
 
+PORTABLE_SERVERS = {"fs-mcp", "sequentialthinking_tools", "openaiDeveloperDocs", "daisyui-mcp", "cloudflare-api", "astra-watch", "ubuntu-local", "ubuntu-flautist"}
+MCP_FIELDS = {"command", "args", "startup_timeout_sec", "tool_timeout_sec", "enabled", "url", "default_tools_approval_mode", "cwd"}
+MCP_ENV = {"FS_MCP_ALLOWED_DIRECTORIES", "FS_MCP_TOOL_PROFILE"}
+
+
+def _portable_location(name: str) -> tuple[str, str] | None:
+    parts = name.split(".")
+    if parts[0] == "mcp_servers" and len(parts) >= 3 and parts[1] in PORTABLE_SERVERS:
+        if len(parts) == 3 and parts[2] in MCP_FIELDS:
+            return f"mcp_servers.{json.dumps(parts[1])}", parts[2]
+        if len(parts) == 4 and parts[2] == "env" and parts[3] in MCP_ENV:
+            return f"mcp_servers.{json.dumps(parts[1])}.env", parts[3]
+        if len(parts) == 5 and parts[2] == "tools" and re.fullmatch(r"[A-Za-z0-9_-]+", parts[3]) and parts[4] == "approval_mode":
+            return f"mcp_servers.{json.dumps(parts[1])}.tools.{json.dumps(parts[3])}", parts[4]
+    if parts[0] == "agents":
+        if len(parts) == 2 and parts[1] in {"enabled", "default_subagent_model", "default_subagent_reasoning_effort"}:
+            return "agents", parts[1]
+        if len(parts) == 3 and parts[1] in {"worker", "manager"} and parts[2] in {"description", "config_file"}:
+            return f"agents.{parts[1]}", parts[2]
+    return None
+
+
+def _portable_tree(value: dict[str, Any], home: pathlib.Path) -> dict[str, str]:
+    result = {}
+    def walk(node: Any, parts: list[str]) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                walk(item, [*parts, str(key)])
+        elif _portable_location(".".join(parts)):
+            if SECRET_CONTENT_RE.search(json.dumps(node)):
+                return
+            if parts[-1] == "command" and (not isinstance(node, str) or not (node.startswith(str(home) + "/.local/bin/") or (parts[1] == "ubuntu-flautist" and node == "/usr/bin/ssh"))):
+                return
+            if parts[-1] == "config_file" and (not isinstance(node, str) or not SAFE_PROFILE.fullmatch(node)):
+                return
+            if parts[-1] == "url" and node not in {"https://developers.openai.com/mcp", "https://mcp.cloudflare.com/mcp"}:
+                return
+            result[".".join(parts)] = json.dumps(_normalize_host_paths(node, home), sort_keys=True)
+    for root in ("mcp_servers", "agents"):
+        if isinstance(value.get(root), dict): walk(value[root], [root])
+    return result
+
+
 def _toml_state(path: pathlib.Path, filename: str, home: pathlib.Path) -> dict[str, Any]:
     if path.is_symlink():
         return {"name": filename, "exists": True, "hash": None, "portable": {}, "unclassified": {"<symlink>": "blocked"}, "invalid": True}
@@ -251,6 +295,7 @@ def _toml_state(path: pathlib.Path, filename: str, home: pathlib.Path) -> dict[s
             continue
         unclassified[str(key)] = _hash(_redact_and_normalize(value, home, str(key)))
 
+    portable.update(_portable_tree(parsed, home))
     return {"name": filename, "exists": True, "hash": hashlib.sha256(raw).hexdigest(), "portable": portable, "unclassified": unclassified, "invalid": False}
 
 
@@ -351,9 +396,24 @@ def _safe_remote_source(source: str) -> bool:
     return False
 
 
+def _package_content_hash(root: pathlib.Path) -> str | None:
+    if not root.is_dir() or root.is_symlink(): return None
+    rows = []
+    total = 0
+    for file in sorted(root.rglob("*")):
+        relative = file.relative_to(root)
+        if set(relative.parts) & (SKIP_DIRS | {".venv", "target"}) or file.name == ".fleet-artifact-sha256": continue
+        if file.is_symlink(): return None
+        if not file.is_file(): continue
+        total += file.stat().st_size
+        if total > 256 * 1024 * 1024: return None
+        rows.append((relative.as_posix(), _file_hash(file), bool(file.stat().st_mode & 0o111)))
+    return _hash(rows)
+
+
 def _read_plugin_cli(codex: str, env: dict[str, str], codex_home: pathlib.Path, include_package_content: bool) -> dict[str, Any]:
-    marketplaces_result = _run([codex, "plugin", "marketplace", "list", "--json"], env=env)
-    plugins_result = _run([codex, "plugin", "list", "--json"], env=env)
+    marketplaces_result = _run([codex, "plugin", "marketplace", "list", "--json"], env=env, timeout=45)
+    plugins_result = _run([codex, "plugin", "list", "--json"], env=env, timeout=45)
     if marketplaces_result.returncode != 0 or plugins_result.returncode != 0:
         return {"available": False, "error": "Codex plugin commands are not available", "marketplaces": [], "plugins": [], "localPackages": {}, "hash": _hash("unavailable")}
     try:
@@ -411,6 +471,8 @@ def _read_plugin_cli(codex: str, env: dict[str, str], codex_home: pathlib.Path, 
         record = {"name": name, "marketplaceName": market, "enabled": enabled, "marketplaceKind": market_info["kind"], "selector": f"{name}@{market}"}
         if isinstance(version, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,100}", version):
             record["version"] = version
+        if market == "fleet-release" and "version" in record:
+            record["artifactHash"] = _package_content_hash(codex_home / "plugins/cache" / market / name / record["version"])
         plugins.append(record)
         if market_info["kind"] == "local":
             package = _find_local_plugin_package(market_info, name, codex_home)
@@ -420,6 +482,7 @@ def _read_plugin_cli(codex: str, env: dict[str, str], codex_home: pathlib.Path, 
                 record["packageHash"] = package["hash"]
             else:
                 record["transferBlocked"] = True
+                record["packageHash"] = package.get("hash")
 
     plugins.sort(key=lambda entry: (entry["marketplaceName"].lower(), entry["name"].lower()))
     marketplaces.sort(key=lambda entry: entry["name"].lower())
@@ -435,6 +498,10 @@ def _read_plugin_cli(codex: str, env: dict[str, str], codex_home: pathlib.Path, 
         "localPackages": local_packages,
         "hash": _hash({"marketplaces": internal_marketplaces, "plugins": plugins}),
     }
+
+
+def _decode_file(encoded: str) -> bytes:
+    return base64.b64decode(encoded.removeprefix("exec:"), validate=True)
 
 
 def _safe_file_content(data: bytes) -> bool:
@@ -475,7 +542,7 @@ def _collect_regular_tree(root: pathlib.Path, *, require_skill: bool = False) ->
             return {}, "source exceeds the transfer size limit"
         if relative.as_posix().lower() == "skill.md" or relative.name.lower() == "skill.md":
             has_skill = True
-        files[relative.as_posix()] = base64.b64encode(data).decode("ascii")
+        files[relative.as_posix()] = ("exec:" if path.stat().st_mode & 0o111 else "") + base64.b64encode(data).decode("ascii")
     if require_skill and not has_skill:
         return {}, "skill directory has no SKILL.md"
     return files, None
@@ -529,7 +596,7 @@ def _find_local_plugin_package(marketplace: dict[str, Any], plugin_name: str, co
             return {"ok": False, "reason": "plugin manifest name does not match the marketplace entry"}
         files, error = _collect_regular_tree(package_root)
         if error:
-            return {"ok": False, "reason": error}
+            return {"ok": False, "reason": error, "hash": _package_content_hash(package_root)}
         if not files:
             return {"ok": False, "reason": "plugin package is empty"}
         return {"ok": True, "files": files, "hash": _hash(files)}
@@ -568,7 +635,7 @@ def _skill_inventory(home: pathlib.Path, codex_home: pathlib.Path, include_conte
                 blocked.append(key)
                 continue
             file_hashes = {
-                relative: hashlib.sha256(base64.b64decode(encoded)).hexdigest()
+                relative: hashlib.sha256(_decode_file(encoded) + (b"\0exec" if encoded.startswith("exec:") else b"\0data")).hexdigest()
                 for relative, encoded in files.items()
             }
             content = files if include_content else {}
@@ -761,6 +828,25 @@ def _active_turn_state(codex: str, env: dict[str, str], codex_home: pathlib.Path
                     pass
 
 
+def _dependency_inventory() -> dict[str, str | None]:
+    env = os.environ.copy()
+    home = pathlib.Path.home()
+    env["PATH"] = str(home / ".local/bin") + ":" + str(home / ".bun/bin") + ":" + env.get("PATH", "")
+    result: dict[str, str | None] = {}
+    for name in ("node", "uv", "bun"):
+        executable = shutil.which(name, path=env["PATH"])
+        if not executable:
+            result[name] = None
+            continue
+        try:
+            version = _run([executable, "--version"], env=env, timeout=5)
+            match = re.search(r"[0-9]+\.[0-9]+\.[0-9]+", version.stdout)
+            result[name] = match.group(0) if version.returncode == 0 and match else None
+        except SyncError:
+            result[name] = None
+    return result
+
+
 def inspect(codex_home: pathlib.Path, include_content: bool = False) -> dict[str, Any]:
     home = pathlib.Path.home().resolve()
     env = _codex_env(codex_home)
@@ -811,8 +897,10 @@ def inspect(codex_home: pathlib.Path, include_content: bool = False) -> dict[str
         {key: value for key, value in item.items() if key not in {"root", "source"}}
         for item in plugin_state.get("marketplaces", [])
     ]
-    public_plugins = [{key: value for key, value in item.items() if key not in {"transferBlocked", "packageHash"}} for item in plugin_state.get("plugins", [])]
+    public_plugins = [{key: value for key, value in item.items() if key not in {"transferBlocked", "packageHash", "artifactHash"}} for item in plugin_state.get("plugins", [])]
+    dependencies = _dependency_inventory()
     snapshot_hash = _hash({
+        "dependencies": dependencies,
         "cliVersion": cli_version,
         "runtimeVersion": runtime_version,
         "runtimeStatus": runtime_status,
@@ -832,6 +920,7 @@ def inspect(codex_home: pathlib.Path, include_content: bool = False) -> dict[str
         "runtimeVersion": runtime_version if isinstance(runtime_version, str) else None,
         "runtimeStatus": runtime_status,
         "activeTurns": active_turns,
+        "dependencies": dependencies,
         "codexHome": home_status,
         "config": config,
         "plugins": {"available": plugin_state.get("available", False), "error": plugin_state.get("error"), "marketplaces": plugin_state.get("marketplaces", []), "plugins": plugin_state.get("plugins", []), "localPackages": plugin_state.get("localPackages", {}), "hash": plugin_state.get("hash")},
@@ -856,7 +945,11 @@ def _toml_scalar(value: Any) -> str:
         return "true" if value else "false"
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
-    raise SyncError("Only classified scalar Codex settings can be applied")
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_scalar(item) for item in value) + "]"
+    raise SyncError("Only classified Codex values can be applied")
 
 
 def _toml_value_lines_end(lines: list[str], start: int) -> int:
@@ -899,6 +992,19 @@ def _toml_value_lines_end(lines: list[str], start: int) -> int:
     return len(lines)
 
 
+def _section_identity(header: str) -> tuple[str, ...] | None:
+    try:
+        value = tomllib.loads(header + "\n__fleet_marker__ = true\n")
+        parts = []
+        while isinstance(value, dict) and "__fleet_marker__" not in value:
+            if len(value) != 1: return None
+            key, value = next(iter(value.items()))
+            parts.append(key)
+        return tuple(parts)
+    except tomllib.TOMLDecodeError:
+        return None
+
+
 def _patch_toml_key(text: str, section: str | None, key: str, value: Any | None) -> str:
     lines = text.splitlines(keepends=True)
     if not lines:
@@ -909,7 +1015,7 @@ def _patch_toml_key(text: str, section: str | None, key: str, value: Any | None)
     if section:
         section_start = -1
         for idx, line in enumerate(lines):
-            if line.strip() == target_header:
+            if line.strip() == target_header or (line.strip().startswith("[") and _section_identity(line.strip()) == _section_identity(target_header)):
                 section_start = idx + 1
                 section_end = len(lines)
                 for next_idx in range(section_start, len(lines)):
@@ -955,6 +1061,9 @@ def _patch_toml_key(text: str, section: str | None, key: str, value: Any | None)
 
 
 def _setting_location(name: str) -> tuple[str | None, str]:
+    location = _portable_location(name)
+    if location:
+        return location
     if name.startswith("features."):
         key = name.split(".", 1)[1]
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", key):
@@ -987,7 +1096,7 @@ def _atomic_write(path: pathlib.Path, data: bytes, mode: int = 0o600) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(temporary, mode & 0o600)
+        os.chmod(temporary, mode & 0o700)
         os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY)
         try:
@@ -1032,6 +1141,25 @@ def _apply_configs(codex_home: pathlib.Path, actions: Any, run_id: str) -> dict[
                 if not isinstance(name, str):
                     raise SyncError("Invalid setting name")
                 section, key = _setting_location(name)
+                if _portable_location(name):
+                    if not isinstance(value, str):
+                        raise SyncError("Invalid portable capability value")
+                    decoded = json.loads(value)
+                    # Reclassify before applying and expand only the actual user's home.
+                    check: dict[str, Any] = {}
+                    cursor = check
+                    parts = name.split(".")
+                    for part in parts[:-1]:
+                        cursor = cursor.setdefault(part, {})
+                    cursor[parts[-1]] = decoded
+                    normalized = json.dumps(decoded)
+                    home = pathlib.Path.home()
+                    candidate_check = json.loads(normalized.replace('"~"', json.dumps(str(home))).replace("~/", str(home) + "/"))
+                    cursor[parts[-1]] = candidate_check
+                    if name not in _portable_tree(check, home):
+                        raise SyncError("Portable capability failed validation")
+                    updated = _patch_toml_key(updated, section, key, candidate_check)
+                    continue
                 if section == "features" or section == "sandbox_workspace_write":
                     if not isinstance(value, bool):
                         raise SyncError("Only boolean nested settings can be applied")
@@ -1111,13 +1239,13 @@ def _write_local_marketplace(codex_home: pathlib.Path, marketplace: dict[str, An
             if relative.is_absolute() or ".." in relative.parts or not isinstance(encoded, str):
                 raise SyncError("Invalid plugin package file path")
             try:
-                content = base64.b64decode(encoded, validate=True)
+                content = _decode_file(encoded)
             except ValueError as error:
                 raise SyncError("Invalid plugin package encoding") from error
             if len(content) > MAX_FILE_BYTES or not _safe_file_content(content):
                 raise SyncError("Plugin package failed the content safety check")
             destination = package_dir.joinpath(*relative.parts)
-            _atomic_write(destination, content, 0o600)
+            _atomic_write(destination, content, 0o700 if encoded.startswith("exec:") else 0o600)
         manifest_paths = [package_dir / "plugin.json", package_dir / ".codex-plugin/plugin.json"]
         manifests = []
         for manifest in manifest_paths:
@@ -1249,7 +1377,7 @@ def _apply_skills(home: pathlib.Path, codex_home: pathlib.Path, actions: Any, ru
         if relative.is_absolute() or not relative.parts or ".." in relative.parts or any(part in SKIP_DIRS for part in relative.parts) or "\\" in relative_name:
             raise SyncError("Unsafe skill path")
         try:
-            content = base64.b64decode(item.get("content", ""), validate=True)
+            content = _decode_file(item.get("content", ""))
         except (ValueError, TypeError) as error:
             raise SyncError("Invalid skill file encoding") from error
         if len(content) > MAX_FILE_BYTES or not _safe_file_content(content):
@@ -1260,7 +1388,7 @@ def _apply_skills(home: pathlib.Path, codex_home: pathlib.Path, actions: Any, ru
             _private_directory(backup_path.parent, codex_home)
             shutil.copy2(destination, backup_path)
             os.chmod(backup_path, 0o600)
-        _atomic_write(destination, content, 0o600)
+        _atomic_write(destination, content, 0o700 if item.get("content", "").startswith("exec:") else 0o600)
         changed += 1
     for item in actions.get("delete", []):
         if not isinstance(item, dict) or item.get("root") not in roots:
@@ -1379,6 +1507,7 @@ def apply(codex_home: pathlib.Path, request: dict[str, Any]) -> dict[str, Any]:
     ) or (
         categories.get("plugins", {}).get("status") == "applied" and categories.get("plugins", {}).get("operations", 0) > 0
     )
+    affected = affected or request.get("nativeActivated") is True
     return {"categories": categories, "restartRequired": affected, "versions": {"cli": request.get("targetVersion")}}
 
 
@@ -1415,7 +1544,14 @@ def _restart_managed_if_idle(codex_home: pathlib.Path) -> dict[str, Any]:
     else:
         return {"status": "deferred", "reason": "Managed daemon restart is unsupported on this host"}
     if result.returncode != 0:
-        return {"status": "failed", "reason": "Managed Codex daemon restart failed"}
+        # A startup readiness timeout can leave the unit failed after it stopped
+        # the idle daemon. Restore service with the bounded down-only start path.
+        recovery = _run([codex, "app-server", "daemon", "start"], env=env, timeout=120)
+        if recovery.returncode == 0:
+            if sys.platform.startswith("linux"):
+                _run(["systemctl", "--user", "start", "codex-app-server.service"], env=env, timeout=120)
+            return {"status": "restarted", "reason": "Recovered a managed startup readiness timeout"}
+        return {"status": "failed", "reason": "Managed restart and down-only recovery failed"}
     return {"status": "restarted", "reason": None}
 
 
@@ -1425,8 +1561,29 @@ def main() -> int:
         if not isinstance(request, dict):
             raise SyncError("Invalid sync request")
         codex_home = _resolve_codex_home(request.get("codexHome"))
+        expected = request.get("identity")
+        if expected is not None:
+            actual = {"hostname": platform.node(), "system": platform.system(), "machine": platform.machine()}
+            if not isinstance(expected, dict) or any(str(expected.get(k, "")).lower() != v.lower() for k, v in actual.items()):
+                raise SyncError("Host identity or architecture mismatch; operation refused")
         operation = request.get("operation")
-        if operation == "inspect":
+        if operation == "stage-directory":
+            build = (pathlib.Path.home() / "build").resolve()
+            if build.stat().st_uid != os.getuid():
+                raise SyncError("Fleet staging parent is not user-owned")
+            stage = build / "codex-fleet-sync"
+            _assert_no_symlink_components(stage, build)
+            stage.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(stage, 0o700)
+            artifacts = _private_directory(stage / "artifacts", stage)
+            for digest in request.get("artifacts", []):
+                if not isinstance(digest, str) or not re.fullmatch(r"[a-f0-9]{64}", digest):
+                    raise SyncError("Invalid artifact reference")
+                _assert_no_symlink_components(artifacts / (digest + ".tar.gz"), stage)
+            result = {"status": "ready"}
+        elif operation == "activate-artifact":
+            result = activate_fleet_artifact(request)
+        elif operation == "inspect":
             result = inspect(codex_home, request.get("includeContent") is True)
         elif operation == "apply":
             result = apply(codex_home, request)

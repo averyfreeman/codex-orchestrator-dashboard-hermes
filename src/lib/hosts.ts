@@ -1,11 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import type { ResourceMetrics } from "@/lib/resource-metrics";
 
 /** One allowlisted local or SSH-reachable machine in the private fleet inventory. */
 export type HostDefinition = {
   /** Stable, URL-safe key used by control requests. */
   slug: string;
+  identity?: { hostname: string; system: string; machine: string };
   /** Human-readable dashboard label. */
   name: string;
   /** Display-only operating system label. */
@@ -25,10 +27,10 @@ export type HostDefinition = {
 };
 
 /** Browser-safe host metadata without private SSH or Codex-home configuration. */
-export type PublicHostDefinition = Omit<HostDefinition, "sshRoutes" | "codexHome">;
+export type PublicHostDefinition = Omit<HostDefinition, "sshRoutes" | "codexHome" | "identity">;
 
-/** Supported overlay transports for SSH routes. */
-export type SshTransport = "zerotier" | "tailscale";
+/** Supported private LAN and overlay transports for SSH routes. */
+export type SshTransport = "lan" | "zerotier" | "tailscale";
 /** Selected transport reported by a local, remote, or failed probe. */
 export type ConnectionTransport = SshTransport | "local" | "unavailable";
 
@@ -49,7 +51,11 @@ function loadHosts(): HostDefinition[] {
     try {
       if (!existsSync(/*turbopackIgnore: true*/ file)) continue;
       const value: unknown = JSON.parse(readFileSync(/*turbopackIgnore: true*/ file, "utf8"));
-      if (Array.isArray(value) && value.every(isHostDefinition)) return value;
+      if (Array.isArray(value) && value.every(isHostDefinition)) {
+        const locals = value.filter((host) => host.local);
+        if (locals.length > 1 || locals.some((host) => host.identity && !matchesHostIdentity(host.identity, { hostname: os.hostname(), system: os.type(), machine: os.machine() }))) return [];
+        return value;
+      }
     } catch {
       // An invalid local inventory fails closed; it must not trigger SSH probes.
       if (file === configuredPath) return [];
@@ -91,13 +97,14 @@ function publicHost(host: HostDefinition): PublicHostDefinition {
   const safeHost = { ...host };
   delete safeHost.codexHome;
   delete safeHost.sshRoutes;
+  delete safeHost.identity;
   return safeHost;
 }
 
 function isSshRoute(value: unknown): value is SshRoute {
   if (!value || typeof value !== "object") return false;
   const route = value as Record<string, unknown>;
-  return (route.transport === "zerotier" || route.transport === "tailscale") &&
+  return (route.transport === "lan" || route.transport === "zerotier" || route.transport === "tailscale") &&
     typeof route.target === "string" && typeof route.hostKeyAlias === "string";
 }
 
@@ -209,4 +216,9 @@ export function unavailableReport(
     worktrees: [],
     error: reason,
   };
+}
+
+/** Fail closed when a verified route reaches a different host or architecture. */
+export function matchesHostIdentity(expected: NonNullable<HostDefinition["identity"]>, actual: NonNullable<HostDefinition["identity"]>) {
+  return expected.hostname.toLowerCase() === actual.hostname.toLowerCase() && expected.system === actual.system && expected.machine === actual.machine;
 }

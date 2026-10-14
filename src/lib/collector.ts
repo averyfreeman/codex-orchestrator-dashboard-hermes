@@ -1,3 +1,4 @@
+import { localPythonRuntime } from "@/lib/helper-runtime";
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
@@ -55,14 +56,16 @@ export async function sshWithFailover<T>(
 
 async function collectOne(host: HostDefinition): Promise<HostReport> {
   try {
-    const script = await probe;
+    const expected = host.identity;
+    const identityCheck = expected ? `\nimport platform\nassert {"hostname": platform.node().lower(), "system": platform.system(), "machine": platform.machine()} == ${JSON.stringify({ ...expected, hostname: expected.hostname.toLowerCase() })}, "host identity mismatch"\n` : "";
+    const script = (await probe) + identityCheck;
     const options = { timeout: 14_000, maxBuffer: 1_000_000, encoding: "utf8" as const };
     let result;
     let connection: HostReport["connection"];
     if (host.local) {
-      result = await execFileAsync("python3", ["-c", script], {
+      result = await execFileAsync(localPythonRuntime(host.identity?.system).command, ["-c", script], {
         ...options,
-        env: { ...process.env, CODEX_HOME: localCodexHome(host) },
+        env: { ...localPythonRuntime(host.identity?.system).environment, CODEX_HOME: localCodexHome(host) },
       });
       connection = { transport: "local", target: null };
     } else {

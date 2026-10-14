@@ -63,7 +63,7 @@ Ready tasks dispatch in dependency order, up to four active primary workers per 
 
 ## Profiles and permission controls
 
-The shared Codex user defaults are `gpt-6-luna` with maximum reasoning effort, `approval_policy = "never"`, a `workspace-write` sandbox, the current user's `$HOME` as an additional writable root, command networking enabled, and `web_search = "live"`. The profile synchronizer applies only these declared defaults, including the managed `sandbox_workspace_write.network_access` and `writable_roots` values, while preserving auth, MCP/plugin settings, and other machine-specific config. Named or trusted project profiles may override user-level defaults.
+The shared Codex user defaults follow the corrected reference baseline: `gpt-6.1-sol` with medium reasoning effort, `approval_policy = "never"`, a `workspace-write` sandbox, the current user's `$HOME` as an additional writable root, command networking enabled, and `web_search = "live"`. The profile synchronizer applies only these declared defaults, including the managed `sandbox_workspace_write.network_access` and `writable_roots` values, while preserving auth, MCP/plugin settings, and other machine-specific config. Named or trusted project profiles may override user-level defaults.
 
 Dashboard work also sends request-scoped settings to `thread/start` or `thread/resume` and `turn/start`, so the selected-host turn receives `approvalPolicy = "never"`, the same `$HOME` sandbox boundary, and the dashboard profile's current network setting. The dashboard bridge auto-grants permission requests only for filesystem paths under `$HOME` and sandbox networking when the network switch is on. It declines out-of-scope filesystem permissions and unsupported elicitation requests. Independent connector, browser, model, and operating-system prompts keep their own permission controls.
 
@@ -95,6 +95,8 @@ The private inventory is the source of truth for route order and host identity. 
 For plugin, skill, MCP, and profile propagation, distribute versioned non-secret manifests. Keep credentials and environment-specific MCP values on each host or in a secret manager. Apply changes in an opt-in dashboard-managed profile first, inspect effective config, then promote a reviewed policy to the shared fleet profile. Do not copy auth tokens between hosts.
 
 ## Codex fleet sync
+
+Platform-aware staging, MCP/role-layer classification, verified host identity, and per-host capability variants extend the original sync boundary; see [ADR 0007](adr/0007-platform-aware-fleet-deployment.md). The private inventory can prefer LAN routes while retaining verified overlay fallback. Native packages use file-backed archives rather than the small-file JSON path.
 
 Codex sync is an explicit, on-demand control flow. Each run names one reference host and selected peers, reads current host state when the operator asks for a comparison, presents a short-lived review plan, and applies only after the operator confirms it. The 30-second health poll never creates plans or writes host state. The UI initially selects other currently reachable peers; when the API omits `targetHostSlugs`, the plan includes other hosts reachable to the on-demand inspection.
 

@@ -21,3 +21,7 @@ Keep plan, apply, and run-status routes behind the existing local same-origin lo
 ## Consequences
 
 Every sync is operator-directed and reviewable, and routine polling remains read-only. A target may finish partially when a category is blocked or an individual host is unreachable; outcomes are recorded per host and category. Secret-bearing or unclassified values can differ across hosts without being copied. Per-host home paths may differ while dashboard-managed commands still use the correct explicitly resolved `CODEX_HOME`. Sync plans are intentionally process-local and must be recreated after a dashboard restart.
+
+## Extension
+
+[ADR 0007](0007-platform-aware-fleet-deployment.md) extends the scalar-only configuration and small-file package restrictions with explicit MCP/role classification, host variants, and verified native artifact staging. Its identity and recovery checks also apply to this workflow.
